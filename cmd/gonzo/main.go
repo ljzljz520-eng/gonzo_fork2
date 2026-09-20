@@ -9,6 +9,8 @@ import (
 
 	"github.com/spf13/cobra"
 	"github.com/spf13/viper"
+
+	"github.com/control-theory/gonzo/internal/security"
 )
 
 // Build variables - set by ldflags during build
@@ -26,40 +28,50 @@ func GetVersionInfo() (string, string) {
 
 // Config struct for application configuration
 type Config struct {
-	MemorySize           int           `mapstructure:"memory-size"`
-	UpdateInterval       time.Duration `mapstructure:"update-interval"`
-	LogBuffer            int           `mapstructure:"log-buffer"`
-	TestMode             bool          `mapstructure:"test-mode"`
-	ConfigFile           string        `mapstructure:"config"`
-	AIProvider           string        `mapstructure:"ai-provider"`
-	AIModel              string        `mapstructure:"ai-model"`
-	Files                []string      `mapstructure:"files"`
-	Follow               bool          `mapstructure:"follow"`
-	OTLPEnabled          bool          `mapstructure:"otlp-enabled"`
-	OTLPGRPCPort         int           `mapstructure:"otlp-grpc-port"`
-	OTLPHTTPPort         int           `mapstructure:"otlp-http-port"`
-	VmlogsURL            string        `mapstructure:"vmlogs-url"`
-	VmlogsUser           string        `mapstructure:"vmlogs-user"`
-	VmlogsPassword       string        `mapstructure:"vmlogs-password"`
-	VmlogsQuery          string        `mapstructure:"vmlogs-query"`
-	K8sEnabled           bool          `mapstructure:"k8s-enabled"`
-	K8sKubeconfig        string        `mapstructure:"k8s-kubeconfig"`
-	K8sContext           string        `mapstructure:"k8s-context"`
-	K8sNamespaces        []string      `mapstructure:"k8s-namespaces"`
-	K8sSelector          string        `mapstructure:"k8s-selector"`
-	K8sSince             int64         `mapstructure:"k8s-since"`
-	K8sTailLines         int64         `mapstructure:"k8s-tail-lines"`
-	Skin                 string        `mapstructure:"skin"`
-	StopWords            []string      `mapstructure:"stop-words"`
-	Format               string        `mapstructure:"format"`
-	DisableVersionCheck  bool          `mapstructure:"disable-version-check"`
-	ReverseScrollWheel   bool          `mapstructure:"reverse-scroll-wheel"`
-	UseLogTime           bool          `mapstructure:"use-log-time"`
-	HideChatPane         bool          `mapstructure:"hide-chat-pane"`
+	MemorySize          int           `mapstructure:"memory-size"`
+	UpdateInterval      time.Duration `mapstructure:"update-interval"`
+	LogBuffer           int           `mapstructure:"log-buffer"`
+	TestMode            bool          `mapstructure:"test-mode"`
+	ConfigFile          string        `mapstructure:"config"`
+	AIProvider          string        `mapstructure:"ai-provider"`
+	AIModel             string        `mapstructure:"ai-model"`
+	Files               []string      `mapstructure:"files"`
+	Follow              bool          `mapstructure:"follow"`
+	OTLPEnabled         bool          `mapstructure:"otlp-enabled"`
+	OTLPGRPCPort        int           `mapstructure:"otlp-grpc-port"`
+	OTLPHTTPPort        int           `mapstructure:"otlp-http-port"`
+	VmlogsURL           string        `mapstructure:"vmlogs-url"`
+	VmlogsUser          string        `mapstructure:"vmlogs-user"`
+	VmlogsPassword      string        `mapstructure:"vmlogs-password"`
+	VmlogsQuery         string        `mapstructure:"vmlogs-query"`
+	K8sEnabled          bool          `mapstructure:"k8s-enabled"`
+	K8sKubeconfig       string        `mapstructure:"k8s-kubeconfig"`
+	K8sContext          string        `mapstructure:"k8s-context"`
+	K8sNamespaces       []string      `mapstructure:"k8s-namespaces"`
+	K8sSelector         string        `mapstructure:"k8s-selector"`
+	K8sSince            int64         `mapstructure:"k8s-since"`
+	K8sTailLines        int64         `mapstructure:"k8s-tail-lines"`
+	Skin                string        `mapstructure:"skin"`
+	StopWords           []string      `mapstructure:"stop-words"`
+	Format              string        `mapstructure:"format"`
+	DisableVersionCheck bool          `mapstructure:"disable-version-check"`
+	ReverseScrollWheel  bool          `mapstructure:"reverse-scroll-wheel"`
+	UseLogTime          bool          `mapstructure:"use-log-time"`
+	HideChatPane        bool          `mapstructure:"hide-chat-pane"`
 
 	// Web dashboard (Dstl8 Lite)
 	WebPort     int  `mapstructure:"web-port"`
 	WebDisabled bool `mapstructure:"web-disabled"`
+
+	// OTLP security surface. OTLPSecurity carries the full YAML-defined
+	// configuration (mTLS/SPIFFE, OIDC, API tokens, quotas, tenant
+	// overrides); the scalar fields below are convenience CLI overrides.
+	OTLPSecurity      *security.Config `mapstructure:"otlp-security"`
+	OTLPGRPCAddr      string           `mapstructure:"otlp-grpc-addr"`
+	OTLPHTTPAddr      string           `mapstructure:"otlp-http-addr"`
+	OTLPUnixSocket    string           `mapstructure:"otlp-unix-socket"`
+	OTLPObserveOnly   bool             `mapstructure:"otlp-observe-only"`
+	OTLPDefaultTenant string           `mapstructure:"otlp-default-tenant"`
 }
 
 var (
@@ -173,6 +185,11 @@ func init() {
 	rootCmd.Flags().Bool("otlp-enabled", false, "Enable OTLP listener to receive logs via OpenTelemetry protocol (gRPC and HTTP)")
 	rootCmd.Flags().Int("otlp-grpc-port", 4317, "Port for OTLP gRPC listener (default: 4317)")
 	rootCmd.Flags().Int("otlp-http-port", 4318, "Port for OTLP HTTP listener (default: 4318)")
+	rootCmd.Flags().String("otlp-grpc-addr", "", "OTLP gRPC listen address (default 127.0.0.1:4317; non-loopback requires mTLS/OIDC/tokens)")
+	rootCmd.Flags().String("otlp-http-addr", "", "OTLP HTTP listen address (default 127.0.0.1:4318; non-loopback requires mTLS/OIDC/tokens)")
+	rootCmd.Flags().String("otlp-unix-socket", "", "Also serve OTLP gRPC+HTTP on this Unix domain socket (kernel peer-cred auth, mapped to local tenant)")
+	rootCmd.Flags().Bool("otlp-observe-only", false, "Shadow-mode auth/quota: record rejections but admit unauthenticated traffic to an isolated tenant")
+	rootCmd.Flags().String("otlp-default-tenant", "", "Tenant assigned to credentials that do not encode one (e.g. OIDC without a tenant claim)")
 	rootCmd.Flags().String("vmlogs-url", "", "Victoria Logs URL endpoint for streaming logs (e.g., http://localhost:9428)")
 	rootCmd.Flags().String("vmlogs-user", "", "Victoria Logs basic auth username (can also use GONZO_VMLOGS_USER env var)")
 	rootCmd.Flags().String("vmlogs-password", "", "Victoria Logs basic auth password (can also use GONZO_VMLOGS_PASSWORD env var)")
@@ -208,6 +225,11 @@ func init() {
 	viper.BindPFlag("otlp-enabled", rootCmd.Flags().Lookup("otlp-enabled"))
 	viper.BindPFlag("otlp-grpc-port", rootCmd.Flags().Lookup("otlp-grpc-port"))
 	viper.BindPFlag("otlp-http-port", rootCmd.Flags().Lookup("otlp-http-port"))
+	viper.BindPFlag("otlp-grpc-addr", rootCmd.Flags().Lookup("otlp-grpc-addr"))
+	viper.BindPFlag("otlp-http-addr", rootCmd.Flags().Lookup("otlp-http-addr"))
+	viper.BindPFlag("otlp-unix-socket", rootCmd.Flags().Lookup("otlp-unix-socket"))
+	viper.BindPFlag("otlp-observe-only", rootCmd.Flags().Lookup("otlp-observe-only"))
+	viper.BindPFlag("otlp-default-tenant", rootCmd.Flags().Lookup("otlp-default-tenant"))
 	viper.BindPFlag("vmlogs-url", rootCmd.Flags().Lookup("vmlogs-url"))
 	viper.BindPFlag("vmlogs-user", rootCmd.Flags().Lookup("vmlogs-user"))
 	viper.BindPFlag("vmlogs-password", rootCmd.Flags().Lookup("vmlogs-password"))

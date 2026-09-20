@@ -2,393 +2,515 @@ package otlpreceiver
 
 import (
 	"context"
-	"encoding/json"
+	"crypto/tls"
+	"errors"
 	"fmt"
 	"io"
 	"log"
 	"net"
 	"net/http"
+	"strings"
 	"sync"
+	"time"
 
 	otlpgrpc "go.opentelemetry.io/proto/otlp/collector/logs/v1"
 	commonpb "go.opentelemetry.io/proto/otlp/common/v1"
 	logspb "go.opentelemetry.io/proto/otlp/logs/v1"
+	"golang.org/x/net/http2"
+	"golang.org/x/net/http2/h2c"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/credentials"
+	"google.golang.org/grpc/status"
 	"google.golang.org/protobuf/encoding/protojson"
 	"google.golang.org/protobuf/proto"
+
+	"github.com/control-theory/gonzo/internal/security"
 )
 
-// Receiver is an OTLP logs receiver
-type Receiver struct {
-	grpcPort     int
-	httpPort     int
-	grpcServer   *grpc.Server
-	httpServer   *http.Server
-	grpcListener net.Listener
-	httpListener net.Listener
-	lineChan     chan string
-	wg           sync.WaitGroup
-	ctx          context.Context
-	cancel       context.CancelFunc
+// Sink is the alias for the security package's ingest interface: the
+// command wiring converts authenticated requests to log entries and indexes
+// them per tenant.
+type Sink = security.Sink
 
-	// JSON marshaler/unmarshaler for converting protobuf to JSON
+// Receiver is the secured OTLP logs receiver. Every request flows through:
+//
+//	transport (mTLS / loopback TCP / Unix socket)
+//	  → authenticator (SPIFFE / OIDC / API token / SO_PEERCRED)
+//	  → per-tenant quota (size, rate, cardinality)
+//	  → per-tenant bounded parse queue (fair scheduler, isolated backlog)
+//	  → sink (trusted attribute stamping, conversion, tenant-scoped index)
+type Receiver struct {
+	cfg       *security.Config
+	auth      *security.Authenticator
+	limiter   *security.Limiter
+	scheduler *security.Scheduler
+	rejects   *security.RejectLogger
+	sink      Sink
+	workers   int
+
+	otlpgrpc.UnimplementedLogsServiceServer
+
+	grpcServer *grpc.Server
+	httpServer *http.Server // TCP HTTP surface (TLS when configured)
+	uxServer   *http.Server // Unix socket: h2c gRPC + HTTP/1.1 multiplexed
+
+	listeners []net.Listener
+
 	jsonMarshaler   protojson.MarshalOptions
 	jsonUnmarshaler protojson.UnmarshalOptions
 
-	otlpgrpc.UnimplementedLogsServiceServer
+	wg     sync.WaitGroup
+	ctx    context.Context
+	cancel context.CancelFunc
 }
 
-// NewReceiver creates a new OTLP receiver
-func NewReceiver(grpcPort, httpPort int) *Receiver {
+// Option configures optional receiver parameters.
+type Option func(*Receiver)
+
+// WithWorkers overrides the parse worker pool size.
+func WithWorkers(n int) Option {
+	return func(r *Receiver) { r.workers = n }
+}
+
+// WithLimiter injects an externally constructed limiter so the same
+// per-tenant limits (rate, cardinality, storage) are shared with the engine
+// and other surfaces. When omitted the receiver builds its own.
+func WithLimiter(l *security.Limiter) Option {
+	return func(r *Receiver) {
+		if l != nil {
+			r.limiter = l
+		}
+	}
+}
+
+// Limiter exposes the effective limiter (used after Start for diagnostics).
+func (r *Receiver) Limiter() *security.Limiter { return r.limiter }
+
+// New builds a secured receiver. Call Start to begin serving.
+func New(cfg *security.Config, sink Sink, rejects *security.RejectLogger, opts ...Option) (*Receiver, error) {
+	if cfg == nil {
+		return nil, errors.New("nil security config")
+	}
+	if err := cfg.Normalize(); err != nil {
+		return nil, err
+	}
+	auth, err := security.NewAuthenticator(cfg, rejects)
+	if err != nil {
+		return nil, err
+	}
 	ctx, cancel := context.WithCancel(context.Background())
-	return &Receiver{
-		grpcPort: grpcPort,
-		httpPort: httpPort,
-		lineChan: make(chan string, 1000),
-		ctx:      ctx,
-		cancel:   cancel,
+	r := &Receiver{
+		cfg:     cfg,
+		auth:    auth,
+		limiter: security.NewLimiter(cfg, rejects),
+		rejects: rejects,
+		sink:    sink,
+		ctx:     ctx,
+		cancel:  cancel,
 		jsonMarshaler: protojson.MarshalOptions{
-			UseProtoNames:   true,
-			EmitUnpopulated: false,
-			Indent:          "",
+			UseProtoNames: true,
 		},
 		jsonUnmarshaler: protojson.UnmarshalOptions{
 			DiscardUnknown: true,
 		},
 	}
+	for _, opt := range opts {
+		opt(r)
+	}
+	r.scheduler = security.NewScheduler(ctx, r.limiter, sink, rejects, r.workers)
+	return r, nil
 }
 
-// Start starts the OTLP receiver
+// Start opens all configured listeners.
 func (r *Receiver) Start() error {
-	// Start gRPC server
-	if r.grpcPort > 0 {
-		grpcListener, err := net.Listen("tcp", fmt.Sprintf(":%d", r.grpcPort))
-		if err != nil {
-			return fmt.Errorf("failed to listen on gRPC port %d: %w", r.grpcPort, err)
+	if err := r.validateListenSurface(); err != nil {
+		return err
+	}
+	var tlsCfg *tls.Config
+	if r.cfg.TLS != nil {
+		t, tlsErr := security.BuildServerTLSConfig(r.cfg.TLS)
+		if tlsErr != nil {
+			return tlsErr
 		}
-		r.grpcListener = grpcListener
+		tlsCfg = t
+	}
 
-		// Create gRPC server with increased message size limits
-		r.grpcServer = grpc.NewServer(
-			grpc.MaxRecvMsgSize(4*1024*1024), // 4MB max receive message size
-			grpc.MaxSendMsgSize(4*1024*1024), // 4MB max send message size
+	httpMux := http.NewServeMux()
+	httpMux.HandleFunc("/v1/logs", r.handleHTTPLogs)
+	authedMux := r.auth.HTTPMiddleware("http", httpMux)
+
+	// gRPC surface (TCP). The same grpc.Server is also served over the
+	// Unix socket via h2c multiplexing, so interceptors protect both.
+	{
+		var grpcOpts []grpc.ServerOption
+		grpcOpts = append(grpcOpts,
+			grpc.MaxRecvMsgSize(security.HardMaxMessageBytes),
+			grpc.MaxSendMsgSize(security.HardMaxMessageBytes),
+			grpc.ChainUnaryInterceptor(r.auth.GRPCUnaryInterceptor, r.grpcQuotaInterceptor),
+			grpc.ChainStreamInterceptor(r.auth.GRPCStreamInterceptor),
 		)
-
-		// Register the OTLP logs service
+		if tlsCfg != nil {
+			grpcOpts = append(grpcOpts, grpc.Creds(credentials.NewTLS(tlsCfg)))
+		}
+		r.grpcServer = grpc.NewServer(grpcOpts...)
 		otlpgrpc.RegisterLogsServiceServer(r.grpcServer, r)
-
-		// Start serving in a goroutine
-		r.wg.Go(func() {
-			log.Printf("OTLP gRPC receiver listening on port %d", r.grpcPort)
-			if err := r.grpcServer.Serve(grpcListener); err != nil && err != grpc.ErrServerStopped {
-				log.Printf("OTLP gRPC receiver serve error: %v", err)
-			}
-		})
 	}
 
-	// Start HTTP server
-	if r.httpPort > 0 {
-		httpListener, err := net.Listen("tcp", fmt.Sprintf(":%d", r.httpPort))
+	// TCP HTTP surface.
+	r.httpServer = &http.Server{
+		Handler:           authedMux,
+		ReadHeaderTimeout: 10 * time.Second,
+	}
+	if tlsCfg != nil {
+		r.httpServer.TLSConfig = tlsCfg
+	}
+
+	// TCP gRPC listener.
+	if r.cfg.GRPCAddr != "" {
+		ln, err := net.Listen("tcp", r.cfg.GRPCAddr)
 		if err != nil {
-			return fmt.Errorf("failed to listen on HTTP port %d: %w", r.httpPort, err)
+			r.closeAll()
+			return fmt.Errorf("listen gRPC %s: %w", r.cfg.GRPCAddr, err)
 		}
-		r.httpListener = httpListener
-
-		// Create HTTP server with routes
-		mux := http.NewServeMux()
-		mux.HandleFunc("/v1/logs", r.handleHTTPLogs)
-
-		r.httpServer = &http.Server{
-			Handler: mux,
-		}
-
-		// Start serving in a goroutine
-		r.wg.Go(func() {
-			log.Printf("OTLP HTTP receiver listening on port %d", r.httpPort)
-			if err := r.httpServer.Serve(httpListener); err != nil && err != http.ErrServerClosed {
-				log.Printf("OTLP HTTP receiver serve error: %v", err)
-			}
-		})
+		r.listeners = append(r.listeners, ln)
+		r.serveGRPC(ln, "grpc-tcp")
+		log.Printf("OTLP gRPC receiver listening on %s%s", r.cfg.GRPCAddr, tlsLabel(tlsCfg))
 	}
 
+	// TCP HTTP listener.
+	if r.cfg.HTTPAddr != "" {
+		ln, err := net.Listen("tcp", r.cfg.HTTPAddr)
+		if err != nil {
+			r.closeAll()
+			return fmt.Errorf("listen HTTP %s: %w", r.cfg.HTTPAddr, err)
+		}
+		r.listeners = append(r.listeners, ln)
+		r.serveHTTP(r.httpServer, ln, tlsCfg != nil, "http-tcp")
+		log.Printf("OTLP HTTP receiver listening on %s%s", r.cfg.HTTPAddr, tlsLabel(tlsCfg))
+	}
+
+	// Unix domain socket: one socket multiplexes h2c gRPC and HTTP/1.1
+	// OTLP/JSON. Identity comes from kernel peer credentials.
+	if r.cfg.UnixSocket != "" {
+		ln, err := security.ListenUnix(r.cfg.UnixSocket, r.cfg.UnixSocketMode)
+		if err != nil {
+			r.closeAll()
+			return err
+		}
+		r.listeners = append(r.listeners, ln)
+		r.uxServer = &http.Server{
+			Handler:           r.unixMux(authedMux),
+			ReadHeaderTimeout: 10 * time.Second,
+		}
+		r.serveHTTP(r.uxServer, ln, false, "unix")
+		log.Printf("OTLP receiver listening on unix socket %s (mode %s, gRPC+HTTP)",
+			r.cfg.UnixSocket, r.cfg.UnixSocketMode)
+	}
+
+	r.scheduler.Start()
 	return nil
 }
 
-// Stop stops the OTLP receiver
-func (r *Receiver) Stop() {
-	if r.cancel != nil {
-		r.cancel()
-	}
+// unixMux routes h2c gRPC traffic to the grpc.Server (its interceptors
+// extract SO_PEERCRED-derived identity from the peer address) and everything
+// else to the authenticated OTLP HTTP mux.
+func (r *Receiver) unixMux(httpHandler http.Handler) http.Handler {
+	h2s := &http2.Server{}
+	handler := http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		if req.ProtoMajor == 2 && isGRPCPath(req.URL.Path) {
+			r.grpcServer.ServeHTTP(w, req)
+			return
+		}
+		httpHandler.ServeHTTP(w, req)
+	})
+	return h2c.NewHandler(handler, h2s)
+}
 
+func isGRPCPath(path string) bool {
+	return strings.Contains(path, "LogsService/")
+}
+
+func tlsLabel(s *tls.Config) string {
+	if s == nil {
+		return " (plaintext; loopback/UDS only — use mTLS for network access)"
+	}
+	return " (mTLS, client cert required)"
+}
+
+func (r *Receiver) serveGRPC(ln net.Listener, name string) {
+	r.wg.Go(func() {
+		if err := r.grpcServer.Serve(ln); err != nil && err != grpc.ErrServerStopped {
+			log.Printf("OTLP %s serve error: %v", name, err)
+		}
+	})
+}
+
+func (r *Receiver) serveHTTP(srv *http.Server, ln net.Listener, useTLS bool, name string) {
+	r.wg.Go(func() {
+		var err error
+		if useTLS {
+			err = srv.ServeTLS(ln, "", "")
+		} else {
+			err = srv.Serve(ln)
+		}
+		if err != nil && !errors.Is(err, http.ErrServerClosed) {
+			log.Printf("OTLP %s serve error: %v", name, err)
+		}
+	})
+}
+
+// validateListenSurface refuses insecure non-loopback TCP: unauthenticated
+// injection over the network is the exact footgun this receiver exists to
+// prevent. Operators must configure mTLS/OIDC/tokens, bind loopback, or use
+// a Unix socket.
+func (r *Receiver) validateListenSurface() error {
+	authConfigured := r.cfg.TLS != nil || r.cfg.OIDC != nil || len(r.cfg.APITokens) > 0
+	if authConfigured || r.cfg.ObserveOnly {
+		return nil
+	}
+	for _, addr := range []string{r.cfg.GRPCAddr, r.cfg.HTTPAddr} {
+		if addr == "" {
+			continue
+		}
+		host, _, err := net.SplitHostPort(addr)
+		if err != nil {
+			return fmt.Errorf("invalid listen address %q: %w", addr, err)
+		}
+		if host != "" && host != "127.0.0.1" && host != "::1" && host != "localhost" {
+			return fmt.Errorf("refusing to bind %q without authentication: configure mTLS (spiffe), OIDC or api-tokens, use a loopback address, or a unix socket", addr)
+		}
+	}
+	return nil
+}
+
+func (r *Receiver) closeAll() {
+	for _, ln := range r.listeners {
+		_ = ln.Close()
+	}
+}
+
+// Stop gracefully shuts all surfaces down.
+func (r *Receiver) Stop() {
+	r.cancel()
 	if r.grpcServer != nil {
 		r.grpcServer.GracefulStop()
 	}
-
-	if r.httpServer != nil {
-		r.httpServer.Shutdown(context.Background())
+	for _, srv := range []*http.Server{r.httpServer, r.uxServer} {
+		if srv == nil {
+			continue
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+		_ = srv.Shutdown(ctx)
+		cancel()
 	}
-
+	for _, ln := range r.listeners {
+		_ = ln.Close()
+	}
 	r.wg.Wait()
-	close(r.lineChan)
 }
 
-// GetLineChan returns the channel for receiving log lines
-func (r *Receiver) GetLineChan() <-chan string {
-	return r.lineChan
+// Export is the OTLP service implementation. It is unreachable in normal
+// operation because grpcQuotaInterceptor short-circuits after admission; it
+// exists to satisfy the service registration and fails closed.
+func (r *Receiver) Export(context.Context, *otlpgrpc.ExportLogsServiceRequest) (*otlpgrpc.ExportLogsServiceResponse, error) {
+	return nil, status.Error(codes.PermissionDenied, "request bypassed admission interceptors")
 }
 
-// Export implements the OTLP logs service Export method
-func (r *Receiver) Export(ctx context.Context, req *otlpgrpc.ExportLogsServiceRequest) (*otlpgrpc.ExportLogsServiceResponse, error) {
-	// Process each resource logs in the request
-	for _, resourceLogs := range req.ResourceLogs {
-		// Extract resource attributes
-		resourceAttrs := make(map[string]interface{})
-		if resourceLogs.Resource != nil {
-			for _, attr := range resourceLogs.Resource.Attributes {
-				resourceAttrs[attr.Key] = extractAttributeValue(attr.Value)
-			}
-		}
-
-		// Process each scope logs
-		for _, scopeLogs := range resourceLogs.ScopeLogs {
-			// Process each log record
-			for _, logRecord := range scopeLogs.LogRecords {
-				// Convert log record to JSON for processing
-				jsonLine, err := r.convertLogRecordToJSON(logRecord, resourceAttrs)
-				if err != nil {
-					log.Printf("Failed to convert log record to JSON: %v", err)
-					continue
-				}
-
-				// Send to channel if not blocked
-				select {
-				case r.lineChan <- jsonLine:
-				case <-r.ctx.Done():
-					return nil, ctx.Err()
-				default:
-					// Channel is full, drop the log
-					log.Printf("Warning: OTLP receiver channel is full, dropping log")
-				}
-			}
-		}
+// admitRequest runs the post-authentication checks and hands the request to
+// the fair scheduler. It blocks until the sink finishes so backpressure and
+// storage-quota errors are reported to the exporter, which retries on 429.
+func (r *Receiver) admitRequest(ctx context.Context, id *security.Identity, req *otlpgrpc.ExportLogsServiceRequest, wireBytes int, transport string) (*otlpgrpc.ExportLogsServiceResponse, error) {
+	nLogs, seriesKeys := inspectRequest(req)
+	if id.Method == security.MethodUnixSocket {
+		transport = "unix"
 	}
-
-	// Return success response
-	return &otlpgrpc.ExportLogsServiceResponse{}, nil
+	if err := r.limiter.CheckRequest(id, wireBytes, nLogs, seriesKeys, transport); err != nil {
+		return nil, mapQuotaError(err)
+	}
+	job, err := r.scheduler.Submit(id, req, transport)
+	if err != nil {
+		return nil, mapQuotaError(err)
+	}
+	select {
+	case err := <-job.Done():
+		if err != nil {
+			return nil, mapQuotaError(err)
+		}
+		return &otlpgrpc.ExportLogsServiceResponse{}, nil
+	case <-ctx.Done():
+		return nil, status.FromContextError(ctx.Err()).Err()
+	}
 }
 
-// handleHTTPLogs handles HTTP OTLP log requests
+func (r *Receiver) grpcQuotaInterceptor(ctx context.Context, req interface{}, _ *grpc.UnaryServerInfo, handler grpc.UnaryHandler) (interface{}, error) {
+	id, ok := security.IdentityFromContext(ctx)
+	if !ok {
+		// The auth interceptor always sets an identity; fail closed.
+		return nil, status.Error(codes.Unauthenticated, security.ReasonUnauthenticated)
+	}
+	exportReq, ok := req.(*otlpgrpc.ExportLogsServiceRequest)
+	if !ok {
+		return handler(ctx, req)
+	}
+	return r.admitRequest(ctx, id, exportReq, proto.Size(exportReq), "grpc")
+}
+
+// handleHTTPLogs handles HTTP OTLP log requests.
 func (r *Receiver) handleHTTPLogs(w http.ResponseWriter, req *http.Request) {
 	if req.Method != http.MethodPost {
 		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
-
-	// Read the request body
-	body, err := io.ReadAll(req.Body)
-	if err != nil {
-		http.Error(w, "Failed to read request body", http.StatusBadRequest)
+	id, ok := security.IdentityFromContext(req.Context())
+	if !ok {
+		http.Error(w, `{"error":"unauthenticated"}`, http.StatusUnauthorized)
 		return
 	}
-	defer req.Body.Close()
 
-	// Create an ExportLogsServiceRequest
+	q := r.cfg.QuotaFor(id.Tenant)
+	// Cap the body at the tenant's per-message allowance BEFORE reading so
+	// an oversized POST can never buffer unbounded memory.
+	req.Body = http.MaxBytesReader(w, req.Body, int64(q.MaxMessageBytes))
+	body, err := io.ReadAll(req.Body)
+	if err != nil {
+		r.rejects.Record(security.Reject{
+			Tenant: id.Tenant, Source: id.Source, Method: id.Method,
+			Transport: transportOf(id), Reason: security.ReasonMessageSize,
+			Detail: fmt.Sprintf("body exceeds tenant limit %d bytes: %v", q.MaxMessageBytes, err),
+		})
+		w.Header().Set("Retry-After", "1")
+		http.Error(w, `{"error":"message_size"}`, http.StatusRequestEntityTooLarge)
+		return
+	}
+
 	var exportReq otlpgrpc.ExportLogsServiceRequest
-
-	// Check Content-Type to determine how to parse
 	contentType := req.Header.Get("Content-Type")
-	if contentType == "application/x-protobuf" || contentType == "application/protobuf" {
-		// Parse binary protobuf
+	switch {
+	case contentType == "application/x-protobuf" || contentType == "application/protobuf":
 		if err := proto.Unmarshal(body, &exportReq); err != nil {
-			http.Error(w, "Failed to unmarshal protobuf", http.StatusBadRequest)
+			http.Error(w, `{"error":"decode"}`, http.StatusBadRequest)
 			return
 		}
-	} else if contentType == "application/json" {
-		// Parse JSON
+	case contentType == "application/json":
 		if err := r.jsonUnmarshaler.Unmarshal(body, &exportReq); err != nil {
-			http.Error(w, "Failed to unmarshal JSON", http.StatusBadRequest)
+			http.Error(w, `{"error":"decode"}`, http.StatusBadRequest)
 			return
 		}
-	} else {
-		// Try protobuf first, then JSON
+	default:
 		if err := proto.Unmarshal(body, &exportReq); err != nil {
-			// Try JSON
 			if err := r.jsonUnmarshaler.Unmarshal(body, &exportReq); err != nil {
-				http.Error(w, "Failed to unmarshal request", http.StatusBadRequest)
+				http.Error(w, `{"error":"decode"}`, http.StatusBadRequest)
 				return
 			}
 		}
 	}
 
-	// Process the logs using the existing Export method
-	_, err = r.Export(req.Context(), &exportReq)
+	resp, err := r.admitRequest(req.Context(), id, &exportReq, len(body), "http")
 	if err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
+		writeHTTPError(w, err)
 		return
 	}
 
-	// Return success response
-	response := &otlpgrpc.ExportLogsServiceResponse{}
-
-	// Check Accept header to determine response format
 	accept := req.Header.Get("Accept")
 	if accept == "application/json" {
-		// Return JSON response
 		w.Header().Set("Content-Type", "application/json")
-		jsonBytes, _ := r.jsonMarshaler.Marshal(response)
-		w.Write(jsonBytes)
-	} else {
-		// Return protobuf response
-		w.Header().Set("Content-Type", "application/x-protobuf")
-		protoBytes, _ := proto.Marshal(response)
-		w.Write(protoBytes)
+		jsonBytes, _ := r.jsonMarshaler.Marshal(resp)
+		_, _ = w.Write(jsonBytes)
+		return
 	}
+	w.Header().Set("Content-Type", "application/x-protobuf")
+	protoBytes, _ := proto.Marshal(resp)
+	_, _ = w.Write(protoBytes)
 }
 
-// convertLogRecordToJSON converts an OTLP log record to JSON string
-func (r *Receiver) convertLogRecordToJSON(record *logspb.LogRecord, resourceAttrs map[string]interface{}) (string, error) {
-	// Build a simple JSON object that matches what the stdin processing expects
-	jsonMap := make(map[string]interface{})
-
-	// Add time - prefer TimeUnixNano, fallback to ObservedTimeUnixNano
-	if record.TimeUnixNano > 0 {
-		jsonMap["timeUnixNano"] = fmt.Sprintf("%d", record.TimeUnixNano)
-	} else if record.ObservedTimeUnixNano > 0 {
-		// Use observed time as fallback when actual time is missing
-		jsonMap["timeUnixNano"] = fmt.Sprintf("%d", record.ObservedTimeUnixNano)
-		jsonMap["observedTimeUnixNano"] = fmt.Sprintf("%d", record.ObservedTimeUnixNano)
+func transportOf(id *security.Identity) string {
+	if id.Method == security.MethodUnixSocket {
+		return "unix"
 	}
-
-	// Add severity
-	if record.SeverityText != "" {
-		jsonMap["severityText"] = record.SeverityText
-	}
-	if record.SeverityNumber != 0 {
-		jsonMap["severityNumber"] = int(record.SeverityNumber)
-	}
-
-	// Add body (message)
-	if record.Body != nil {
-		switch v := record.Body.Value.(type) {
-		case *commonpb.AnyValue_StringValue:
-			jsonMap["body"] = map[string]interface{}{
-				"stringValue": v.StringValue,
-			}
-		case *commonpb.AnyValue_IntValue:
-			jsonMap["body"] = map[string]interface{}{
-				"intValue": fmt.Sprintf("%d", v.IntValue),
-			}
-		case *commonpb.AnyValue_DoubleValue:
-			jsonMap["body"] = map[string]interface{}{
-				"doubleValue": v.DoubleValue,
-			}
-		case *commonpb.AnyValue_BoolValue:
-			jsonMap["body"] = map[string]interface{}{
-				"boolValue": v.BoolValue,
-			}
-		}
-	}
-
-	// Merge resource and record attributes
-	// First add resource attributes
-	mergedAttrs := make([]map[string]interface{}, 0)
-	for key, value := range resourceAttrs {
-		attr := map[string]interface{}{
-			"key": key,
-			"value": map[string]interface{}{
-				"stringValue": fmt.Sprintf("%v", value),
-			},
-		}
-		mergedAttrs = append(mergedAttrs, attr)
-	}
-
-	// Then add record attributes (they can override resource attributes)
-	for _, attr := range record.Attributes {
-		attrMap := map[string]interface{}{
-			"key": attr.Key,
-		}
-
-		// Extract the value properly
-		if attr.Value != nil {
-			switch v := attr.Value.Value.(type) {
-			case *commonpb.AnyValue_StringValue:
-				attrMap["value"] = map[string]interface{}{
-					"stringValue": v.StringValue,
-				}
-			case *commonpb.AnyValue_IntValue:
-				attrMap["value"] = map[string]interface{}{
-					"intValue": fmt.Sprintf("%d", v.IntValue),
-				}
-			case *commonpb.AnyValue_DoubleValue:
-				attrMap["value"] = map[string]interface{}{
-					"doubleValue": v.DoubleValue,
-				}
-			case *commonpb.AnyValue_BoolValue:
-				attrMap["value"] = map[string]interface{}{
-					"boolValue": v.BoolValue,
-				}
-			}
-		}
-
-		mergedAttrs = append(mergedAttrs, attrMap)
-	}
-
-	// Add merged attributes to the JSON
-	if len(mergedAttrs) > 0 {
-		jsonMap["attributes"] = mergedAttrs
-	}
-
-	// Add trace and span IDs if present
-	if len(record.TraceId) > 0 {
-		jsonMap["traceId"] = fmt.Sprintf("%x", record.TraceId)
-	}
-	if len(record.SpanId) > 0 {
-		jsonMap["spanId"] = fmt.Sprintf("%x", record.SpanId)
-	}
-
-	// Convert to JSON string
-	finalJSON, err := json.Marshal(jsonMap)
-	if err != nil {
-		return "", err
-	}
-
-	return string(finalJSON), nil
+	return "http"
 }
 
-// extractAttributeValue extracts the value from an AnyValue
-func extractAttributeValue(v *commonpb.AnyValue) interface{} {
+// mapQuotaError converts security quota/sink errors to gRPC status codes.
+func mapQuotaError(err error) error {
+	var qErr *security.QuotaError
+	if errors.As(err, &qErr) {
+		switch qErr.Reason {
+		case security.ReasonUnauthenticated:
+			return status.Error(codes.Unauthenticated, qErr.Error())
+		case security.ReasonUnauthorized:
+			return status.Error(codes.PermissionDenied, qErr.Error())
+		default:
+			return status.Error(codes.ResourceExhausted, qErr.Error())
+		}
+	}
+	return status.Error(codes.Internal, err.Error())
+}
+
+func writeHTTPError(w http.ResponseWriter, err error) {
+	st, ok := status.FromError(err)
+	if !ok {
+		http.Error(w, `{"error":"internal"}`, http.StatusInternalServerError)
+		return
+	}
+	code := http.StatusInternalServerError
+	switch st.Code() {
+	case codes.Unauthenticated:
+		code = http.StatusUnauthorized
+		w.Header().Set("WWW-Authenticate", `Bearer realm="gonzo-otlp"`)
+	case codes.PermissionDenied:
+		code = http.StatusForbidden
+	case codes.ResourceExhausted:
+		code = http.StatusTooManyRequests
+		w.Header().Set("Retry-After", "1")
+	}
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(code)
+	_, _ = fmt.Fprintf(w, `{"error":%q,"detail":%q}`, st.Code().String(), st.Message())
+}
+
+// inspectRequest counts log records and derives per-resource series keys.
+func inspectRequest(req *otlpgrpc.ExportLogsServiceRequest) (int, []string) {
+	nLogs := 0
+	keys := make([]string, 0)
+	seen := make(map[string]bool)
+	for _, resourceLogs := range req.ResourceLogs {
+		resourceAttrs := make(map[string]string)
+		if resourceLogs.Resource != nil {
+			for _, attr := range resourceLogs.Resource.Attributes {
+				if attr.Key != "" && attr.Value != nil {
+					resourceAttrs[attr.Key] = anyValueToString(attr.Value)
+				}
+			}
+		}
+		if key := security.SeriesKey(resourceAttrs); key != "" && !seen[key] {
+			seen[key] = true
+			keys = append(keys, key)
+		}
+		for _, scopeLogs := range resourceLogs.ScopeLogs {
+			nLogs += len(scopeLogs.LogRecords)
+		}
+	}
+	return nLogs, keys
+}
+
+func anyValueToString(v *commonpb.AnyValue) string {
 	if v == nil {
-		return nil
+		return ""
 	}
-
 	switch val := v.Value.(type) {
 	case *commonpb.AnyValue_StringValue:
 		return val.StringValue
 	case *commonpb.AnyValue_BoolValue:
-		return val.BoolValue
+		return fmt.Sprintf("%t", val.BoolValue)
 	case *commonpb.AnyValue_IntValue:
-		return val.IntValue
+		return fmt.Sprintf("%d", val.IntValue)
 	case *commonpb.AnyValue_DoubleValue:
-		return val.DoubleValue
-	case *commonpb.AnyValue_ArrayValue:
-		if val.ArrayValue != nil {
-			arr := make([]interface{}, len(val.ArrayValue.Values))
-			for i, v := range val.ArrayValue.Values {
-				arr[i] = extractAttributeValue(v)
-			}
-			return arr
-		}
-	case *commonpb.AnyValue_KvlistValue:
-		if val.KvlistValue != nil {
-			m := make(map[string]interface{})
-			for _, kv := range val.KvlistValue.Values {
-				m[kv.Key] = extractAttributeValue(kv.Value)
-			}
-			return m
-		}
-	case *commonpb.AnyValue_BytesValue:
-		return val.BytesValue
+		return fmt.Sprintf("%g", val.DoubleValue)
+	default:
+		return ""
 	}
-
-	return nil
 }
+
+// Keep the logspb import tied for future record-level checks.
+var _ = logspb.SeverityNumber_SEVERITY_NUMBER_UNSPECIFIED

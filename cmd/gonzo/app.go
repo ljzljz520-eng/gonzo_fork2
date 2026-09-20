@@ -23,6 +23,7 @@ import (
 	"github.com/control-theory/gonzo/internal/otlplog"
 	"github.com/control-theory/gonzo/internal/otlpreceiver"
 	"github.com/control-theory/gonzo/internal/releases"
+	"github.com/control-theory/gonzo/internal/security"
 	"github.com/control-theory/gonzo/internal/state"
 	"github.com/control-theory/gonzo/internal/tui"
 	versioncheck "github.com/control-theory/gonzo/internal/version"
@@ -134,6 +135,23 @@ func runApp(cmd *cobra.Command, args []string) error {
 	// Create shared analysis engine (used by web dashboard)
 	eng := engine.NewEngine(cfg.LogBuffer, textAnalyzer.GetStopWords(), nil, cfg.UseLogTime)
 
+	// Build the OTLP security surface once: the same authenticator,
+	// rejection ledger and limiter back both the OTLP receiver and the web
+	// dashboard, and the limiter also supplies per-tenant storage quotas to
+	// the engine.
+	secCfg := buildOTLPSecurityConfig()
+	rejects := security.NewRejectLogger(512, os.Stderr, secCfg.ObserveOnly)
+	var authenticator *security.Authenticator
+	if securityMethodsConfigured(secCfg) {
+		a, err := security.NewAuthenticator(secCfg, rejects)
+		if err != nil {
+			return fmt.Errorf("OTLP security configuration: %w", err)
+		}
+		authenticator = a
+	}
+	otlpLimiter := security.NewLimiter(secCfg, rejects)
+	eng.SetStorageQuotaProvider(&storageQuotaAdapter{limiter: otlpLimiter})
+
 	tuiModel := &simpleTuiModel{
 		formatDetector: formatDetector,
 		logConverter:   logConverter,
@@ -146,6 +164,9 @@ func runApp(cmd *cobra.Command, args []string) error {
 		updateInterval: cfg.UpdateInterval,
 		testMode:       cfg.TestMode,
 		versionChecker: versionChecker,
+		rejects:        rejects,
+		secCfg:         secCfg,
+		otlpLimiter:    otlpLimiter,
 	}
 
 	var p *tea.Program
@@ -171,7 +192,7 @@ func runApp(cmd *cobra.Command, args []string) error {
 		if distFS, err := fs.Sub(webembed.DistFS, "dist"); err == nil {
 			staticFS = distFS
 		}
-		webSrv := gonzoweb.NewServer(eng, staticFS, currentVersion, relFetcher)
+		webSrv := gonzoweb.NewServer(eng, staticFS, currentVersion, relFetcher, authenticator, rejects)
 		if err := webSrv.Start(ctx, cfg.WebPort); err != nil {
 			log.Printf("Warning: web dashboard failed to start: %v", err)
 		}
@@ -189,10 +210,11 @@ func runApp(cmd *cobra.Command, args []string) error {
 
 // Message types for bubbletea
 type (
-	logLineMsg  string
-	snapshotMsg *memory.FrequencySnapshot
-	finishedMsg struct{}
-	tickMsg     struct {
+	logLineMsg   string
+	snapshotMsg  *memory.FrequencySnapshot
+	otlpEntryMsg *tui.LogEntry
+	finishedMsg  struct{}
+	tickMsg      struct {
 		time     time.Time
 		sequence int
 	}
@@ -237,6 +259,12 @@ type simpleTuiModel struct {
 	// OTLP receiver support
 	otlpReceiver *otlpreceiver.Receiver // OTLP receiver for network input
 	hasOTLPInput bool                   // Whether we're receiving OTLP data
+
+	// Multi-tenant security wiring (shared with the web dashboard)
+	rejects       *security.RejectLogger
+	secCfg        *security.Config
+	otlpLimiter   *security.Limiter
+	otlpEntryChan chan *tui.LogEntry // authenticated OTLP entries mirrored to the TUI
 
 	// Victoria Logs receiver support
 	vmlogsReceiver *vmlogs.Receiver // Victoria Logs receiver for streaming logs
@@ -319,19 +347,28 @@ func (m *simpleTuiModel) Init() tea.Cmd {
 
 	// Check if OTLP receiver is enabled (only if Kubernetes and Victoria Logs are not enabled)
 	if !m.hasK8sInput && !m.hasVmlogsInput && cfg.OTLPEnabled {
-		// OTLP input mode
+		// OTLP input mode. Authenticated exports go through the security
+		// scheduler directly into the per-tenant engine index (and,
+		// best-effort, to the local TUI display feed) — never through the
+		// untrusted line channel.
 		m.hasOTLPInput = true
-		m.inputChan = make(chan string, 100)
+		m.otlpEntryChan = make(chan *tui.LogEntry, 256)
 
-		// Create and start OTLP receiver
-		m.otlpReceiver = otlpreceiver.NewReceiver(cfg.OTLPGRPCPort, cfg.OTLPHTTPPort)
-		if err := m.otlpReceiver.Start(); err != nil {
-			log.Printf("Error starting OTLP receiver: %v", err)
-			// Fall back to other input methods if OTLP fails
+		sink := &otlpIngestSink{eng: m.engine, display: m.otlpEntryChan}
+		receiver, err := otlpreceiver.New(m.secCfg, sink, m.rejects,
+			otlpreceiver.WithLimiter(m.otlpLimiter))
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Error creating OTLP receiver: %v\n", err)
+			m.hasOTLPInput = false
+		} else if err := receiver.Start(); err != nil {
+			fmt.Fprintf(os.Stderr, "Error starting OTLP receiver: %v\n", err)
 			m.hasOTLPInput = false
 		} else {
-			// Start reading from OTLP receiver in the background
-			go m.readOTLPAsync()
+			m.otlpReceiver = receiver
+			go func() {
+				<-m.ctx.Done()
+				receiver.Stop()
+			}()
 		}
 	}
 
@@ -381,9 +418,16 @@ func (m *simpleTuiModel) Init() tea.Cmd {
 	cmds = append(cmds, dashboardCmd)
 	cmds = append(cmds, m.periodicUpdate())
 
-	// Start checking for input data if we have any input source
-	if m.hasStdinData || m.hasFileInput || m.hasOTLPInput || m.hasVmlogsInput || m.hasK8sInput {
+	// Start checking for input data if we have a line-based input source
+	// (OTLP ingests directly through the secured sink, not the line channel)
+	if m.hasStdinData || m.hasFileInput || m.hasVmlogsInput || m.hasK8sInput {
 		cmds = append(cmds, m.checkInputChannel())
+	}
+
+	// Subscribe to authenticated, tenant-tagged OTLP entries for local
+	// TUI display (indexing itself happens in the sink, not here).
+	if m.hasOTLPInput {
+		cmds = append(cmds, m.waitOTLPEntries())
 	}
 
 	return tea.Batch(cmds...)
@@ -442,39 +486,6 @@ func (m *simpleTuiModel) readVmlogsAsync() {
 		case line, ok := <-vmlogsLineChan:
 			if !ok {
 				// Victoria Logs receiver finished
-				return
-			}
-			if line != "" {
-				select {
-				case m.inputChan <- line:
-				case <-m.ctx.Done():
-					return
-				}
-			}
-		}
-	}
-}
-
-// readOTLPAsync reads from the OTLP receiver
-func (m *simpleTuiModel) readOTLPAsync() {
-	defer close(m.inputChan)
-
-	if m.otlpReceiver == nil {
-		return
-	}
-
-	// Get the channel from OTLP receiver
-	otlpLineChan := m.otlpReceiver.GetLineChan()
-
-	// Forward lines from OTLP receiver to input channel
-	for {
-		select {
-		case <-m.ctx.Done():
-			m.otlpReceiver.Stop()
-			return
-		case line, ok := <-otlpLineChan:
-			if !ok {
-				// OTLP receiver finished
 				return
 			}
 			if line != "" {
@@ -602,6 +613,22 @@ func (m *simpleTuiModel) readStdinAsync() {
 	}
 }
 
+// waitOTLPEntries subscribes to authenticated OTLP entries mirrored from
+// the secured sink for the local TUI display.
+func (m *simpleTuiModel) waitOTLPEntries() tea.Cmd {
+	return func() tea.Msg {
+		select {
+		case entry, ok := <-m.otlpEntryChan:
+			if !ok {
+				return finishedMsg{}
+			}
+			return otlpEntryMsg(entry)
+		case <-m.ctx.Done():
+			return finishedMsg{}
+		}
+	}
+}
+
 // checkInputChannel checks for data from the unified input channel
 func (m *simpleTuiModel) checkInputChannel() tea.Cmd {
 	return func() tea.Msg {
@@ -677,6 +704,16 @@ func (m *simpleTuiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			cmds = append(cmds, m.checkInputChannel())
 		}
 
+	case otlpEntryMsg:
+		// Already authenticated, converted and indexed per-tenant by the
+		// sink; here we only mirror the entry into the local TUI.
+		if msg != nil {
+			m.dashboard.Update(tui.UpdateMsg{NewLogEntry: msg})
+		}
+		if m.hasOTLPInput && !m.finished {
+			cmds = append(cmds, m.waitOTLPEntries())
+		}
+
 	case snapshotMsg:
 		// Send snapshot to dashboard
 		updateMsg := tui.UpdateMsg{
@@ -720,7 +757,7 @@ func (m *simpleTuiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 		// Feed snapshot to the shared engine
 		if m.engine != nil {
-			m.engine.UpdateFrequencySnapshot(snapshot)
+			m.engine.UpdateFrequencySnapshot(engine.LocalTenant, snapshot)
 		}
 
 		// No automatic reset - only manual reset via 'r' key now
@@ -736,7 +773,7 @@ func (m *simpleTuiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 		// Feed interval counts to the shared engine
 		if m.engine != nil && m.severityCounts != nil {
-			m.engine.IngestSeverityCounts(*m.severityCounts)
+			m.engine.IngestSeverityCounts(engine.LocalTenant, *m.severityCounts)
 		}
 
 		// Reset severity counts for next interval

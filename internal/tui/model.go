@@ -46,6 +46,11 @@ type LogEntry struct {
 	Message       string
 	RawLine       string
 	Attributes    map[string]string
+
+	// Tenant is the authoritative tenant key derived from the authenticated
+	// transport identity (mTLS/SPIFFE, OIDC, API token, local UDS). It is
+	// never taken from attacker-controlled log/resource attributes.
+	Tenant string
 }
 
 // ColumnConfig represents a configurable column in the log viewer
@@ -238,14 +243,14 @@ type DashboardModel struct {
 	webPort int // Port for the Dstl8 Lite web dashboard (for browser open shortcut)
 
 	// What's New modal
-	showWhatsNewModal      bool
-	releasesFetcher        *releases.Fetcher
-	currentVersion         string
-	lastSeenVersion        string
-	whatsNewCheckDone      bool   // true after we've checked whether to auto-show
-	whatsNewRetries        int    // retry counter for waiting on background fetch
-	whatsNewRenderedCache  string // pre-rendered content (glamour is expensive)
-	whatsNewCacheWidth     int    // width the cache was rendered at
+	showWhatsNewModal     bool
+	releasesFetcher       *releases.Fetcher
+	currentVersion        string
+	lastSeenVersion       string
+	whatsNewCheckDone     bool   // true after we've checked whether to auto-show
+	whatsNewRetries       int    // retry counter for waiting on background fetch
+	whatsNewRenderedCache string // pre-rendered content (glamour is expensive)
+	whatsNewCacheWidth    int    // width the cache was rendered at
 }
 
 // UpdateMsg contains data updates for the dashboard
@@ -340,11 +345,11 @@ func NewDashboardModel(maxLogBuffer int, updateInterval time.Duration, aiProvide
 		heatmapData:         make([]HeatmapMinute, 0),
 		drain3BySeverity:    InitializeDrain3BySeverity(),
 		servicesBySeverity:  make(map[string][]ServiceCount),
-		availableIntervals: availableIntervals,
-		currentIntervalIdx: currentIdx,
-		infoViewport:       viewport.New(80, 20), // Will be resized later
-		chatViewport:        viewport.New(30, 20),        // Will be resized later
-		modalActiveSection:  "info",                      // Start with info section active
+		availableIntervals:  availableIntervals,
+		currentIntervalIdx:  currentIdx,
+		infoViewport:        viewport.New(80, 20), // Will be resized later
+		chatViewport:        viewport.New(30, 20), // Will be resized later
+		modalActiveSection:  "info",               // Start with info section active
 		chatHistory:         make([]string, 0),
 		chatAutoScroll:      true,               // Enable auto-scroll for new messages
 		chatPaneVisible:     true,               // Chat pane visible by default

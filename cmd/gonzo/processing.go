@@ -4,7 +4,9 @@ import (
 	"strings"
 
 	"github.com/control-theory/gonzo/internal/analyzer"
+	"github.com/control-theory/gonzo/internal/engine"
 	"github.com/control-theory/gonzo/internal/otlplog"
+	"github.com/control-theory/gonzo/internal/security"
 	"github.com/control-theory/gonzo/internal/tui"
 )
 
@@ -151,9 +153,22 @@ func (m *simpleTuiModel) processSingleLogEntry(result *analyzer.AnalysisResult, 
 		// Count severity for this interval
 		m.severityCounts.AddCount(logEntry.Severity)
 
+		// Local inputs (stdin/files/K8s/Victoria Logs) are trusted and
+		// always scoped to the reserved local tenant.
+		logEntry.Tenant = engine.LocalTenant
+
 		// Feed the shared analysis engine (for web dashboard)
 		if m.engine != nil {
-			m.engine.Ingest(*logEntry)
+			if err := m.engine.Ingest(*logEntry); err != nil && m.rejects != nil {
+				m.rejects.Record(security.Reject{
+					Tenant:    engine.LocalTenant,
+					Source:    "local-input",
+					Method:    "local",
+					Transport: "local",
+					Reason:    security.ReasonStorageQuota,
+					Detail:    err.Error(),
+				})
+			}
 		}
 
 		updateMsg := tui.UpdateMsg{NewLogEntry: logEntry}

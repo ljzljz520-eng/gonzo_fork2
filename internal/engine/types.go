@@ -6,6 +6,10 @@ import "time"
 // For local Gonzo, time range filters apply to the in-memory log buffer.
 // Dimension filters (environments, namespaces, etc.) map to log entry attributes.
 type InsightsFilters struct {
+	// Tenant selects the target tenant. Server-side it is forced from the
+	// authenticated scope: non-admin values here are ignored; admin values
+	// are honored only for admin identities.
+	Tenant       string    `json:"tenant,omitempty"`
 	Start        *int64    `json:"start,omitempty"`
 	End          *int64    `json:"end,omitempty"`
 	GroupBy      string    `json:"group_by,omitempty"`
@@ -39,11 +43,11 @@ type SeverityGroup struct {
 
 // SentimentBucket represents one time bucket of sentiment data for a group.
 type SentimentBucket struct {
-	Timestamp   int64   `json:"timestamp"`
-	GroupValue  string  `json:"group_value"`
-	Sentiment   float64 `json:"sentiment"`
-	IsAnomaly   bool    `json:"is_anomaly,omitempty"`
-	LogCount    int     `json:"log_count"`
+	Timestamp  int64   `json:"timestamp"`
+	GroupValue string  `json:"group_value"`
+	Sentiment  float64 `json:"sentiment"`
+	IsAnomaly  bool    `json:"is_anomaly,omitempty"`
+	LogCount   int     `json:"log_count"`
 }
 
 // SentimentData is the response format for sentiment queries.
@@ -113,7 +117,7 @@ type InsightsParams struct {
 
 // StreamInfo represents an active log input stream.
 type StreamInfo struct {
-	Source    string    `json:"source"`
+	Source   string    `json:"source"`
 	Stream   string    `json:"stream"`
 	LogCount int64     `json:"log_count"`
 	LastSeen time.Time `json:"last_seen"`
@@ -122,6 +126,7 @@ type StreamInfo struct {
 
 // StatusInfo represents server status.
 type StatusInfo struct {
+	Tenant       string       `json:"tenant"`
 	Uptime       string       `json:"uptime"`
 	TotalLogs    int64        `json:"total_logs"`
 	TotalBytes   int64        `json:"total_bytes"`
@@ -140,11 +145,22 @@ type AttributeEntry struct {
 	Percentage float64 `json:"percentage"`
 }
 
-// EngineStats holds engine-level statistics.
+// EngineStats holds engine-level statistics for one tenant.
 type EngineStats struct {
-	StartTime      time.Time `json:"start_time"`
-	TotalLogsEver  int       `json:"total_logs_ever"`
-	TotalBytes     int64     `json:"total_bytes"`
-	BufferSize     int       `json:"buffer_size"`
-	BufferUsed     int       `json:"buffer_used"`
+	Tenant        string    `json:"tenant"`
+	StartTime     time.Time `json:"start_time"`
+	TotalLogsEver int       `json:"total_logs_ever"`
+	TotalBytes    int64     `json:"total_bytes"`
+	BufferSize    int       `json:"buffer_size"`
+	BufferUsed    int       `json:"buffer_used"`
+	BufferBytes   int64     `json:"buffer_bytes"`
+}
+
+// TenantInfo is the per-tenant summary returned to admin status callers.
+type TenantInfo struct {
+	Tenant        string `json:"tenant"`
+	TotalLogsEver int    `json:"total_logs_ever"`
+	BufferUsed    int    `json:"buffer_used"`
+	BufferBytes   int64  `json:"buffer_bytes"`
+	BufferSize    int    `json:"buffer_size"`
 }

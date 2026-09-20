@@ -1,6 +1,7 @@
 package web
 
 import (
+	"errors"
 	"net/http"
 	"sort"
 	"strconv"
@@ -9,9 +10,35 @@ import (
 	"github.com/control-theory/gonzo/internal/engine"
 )
 
-func (s *Server) handleStatus(w http.ResponseWriter, _ *http.Request) {
-	stats := s.engine.GetStats()
-	streams := s.engine.GetStreams()
+// failOnScope maps engine scope errors to HTTP status codes. Every handler
+// calls this immediately after deriving its scoped context, so a missing
+// identity never reaches a query.
+func failOnScope(w http.ResponseWriter, err error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, engine.ErrTenantScopeRequired) {
+		writeError(w, http.StatusUnauthorized, err.Error())
+		return true
+	}
+	writeError(w, http.StatusForbidden, err.Error())
+	return true
+}
+
+func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
+	ctx, id, ok := scopedContext(r)
+	if !ok {
+		writeError(w, http.StatusUnauthorized, "unauthenticated")
+		return
+	}
+	stats, err := s.engine.GetStats(ctx)
+	if failOnScope(w, err) {
+		return
+	}
+	streams, err := s.engine.GetStreams(ctx)
+	if failOnScope(w, err) {
+		return
+	}
 
 	uptime := time.Since(stats.StartTime).Round(time.Second).String()
 	logRate := 0.0
@@ -23,7 +50,8 @@ func (s *Server) handleStatus(w http.ResponseWriter, _ *http.Request) {
 	streamInfos := make([]engine.StreamInfo, len(streams))
 	copy(streamInfos, streams)
 
-	writeJSON(w, engine.StatusInfo{
+	status := engine.StatusInfo{
+		Tenant:       id.Tenant,
 		Uptime:       uptime,
 		TotalLogs:    int64(stats.TotalLogsEver),
 		TotalBytes:   stats.TotalBytes,
@@ -32,61 +60,101 @@ func (s *Server) handleStatus(w http.ResponseWriter, _ *http.Request) {
 		BufferSize:   stats.BufferSize,
 		BufferUsed:   stats.BufferUsed,
 		AIConfigured: false,
-	})
+	}
+	if id.Admin {
+		// Admins also see the list of active tenants on the status call.
+		writeJSON(w, struct {
+			engine.StatusInfo
+			Tenants []engine.TenantInfo `json:"tenants,omitempty"`
+		}{
+			StatusInfo: status,
+			Tenants:    s.engine.TenantInfos(),
+		})
+		return
+	}
+	writeJSON(w, status)
 }
 
 func (s *Server) handleSeverity(w http.ResponseWriter, r *http.Request) {
+	ctx, _, ok := scopedContext(r)
+	if !ok {
+		writeError(w, http.StatusUnauthorized, "unauthenticated")
+		return
+	}
 	filters := parseFilters(r)
-	data, err := s.engine.QuerySeverityData(r.Context(), filters)
-	if err != nil {
-		writeError(w, http.StatusInternalServerError, err.Error())
+	data, err := s.engine.QuerySeverityData(ctx, filters)
+	if failOnScope(w, err) {
 		return
 	}
 	writeJSON(w, data)
 }
 
 func (s *Server) handleSentiment(w http.ResponseWriter, r *http.Request) {
+	ctx, _, ok := scopedContext(r)
+	if !ok {
+		writeError(w, http.StatusUnauthorized, "unauthenticated")
+		return
+	}
 	filters := parseFilters(r)
-	data, err := s.engine.QuerySentimentData(r.Context(), filters)
-	if err != nil {
-		writeError(w, http.StatusInternalServerError, err.Error())
+	data, err := s.engine.QuerySentimentData(ctx, filters)
+	if failOnScope(w, err) {
 		return
 	}
 	writeJSON(w, data)
 }
 
 func (s *Server) handlePatterns(w http.ResponseWriter, r *http.Request) {
+	ctx, _, ok := scopedContext(r)
+	if !ok {
+		writeError(w, http.StatusUnauthorized, "unauthenticated")
+		return
+	}
 	filters := parseFilters(r)
-	data, err := s.engine.QueryPatterns(r.Context(), filters)
-	if err != nil {
-		writeError(w, http.StatusInternalServerError, err.Error())
+	data, err := s.engine.QueryPatterns(ctx, filters)
+	if failOnScope(w, err) {
 		return
 	}
 	writeJSON(w, data)
 }
 
 func (s *Server) handleClasses(w http.ResponseWriter, r *http.Request) {
+	ctx, _, ok := scopedContext(r)
+	if !ok {
+		writeError(w, http.StatusUnauthorized, "unauthenticated")
+		return
+	}
 	filters := parseFilters(r)
-	data, err := s.engine.QueryClasses(r.Context(), filters)
-	if err != nil {
-		writeError(w, http.StatusInternalServerError, err.Error())
+	data, err := s.engine.QueryClasses(ctx, filters)
+	if failOnScope(w, err) {
 		return
 	}
 	writeJSON(w, data)
 }
 
 func (s *Server) handleLogs(w http.ResponseWriter, r *http.Request) {
+	ctx, _, ok := scopedContext(r)
+	if !ok {
+		writeError(w, http.StatusUnauthorized, "unauthenticated")
+		return
+	}
 	filters := parseFilters(r)
-	data, err := s.engine.QueryLogSamples(r.Context(), filters)
-	if err != nil {
-		writeError(w, http.StatusInternalServerError, err.Error())
+	data, err := s.engine.QueryLogSamples(ctx, filters)
+	if failOnScope(w, err) {
 		return
 	}
 	writeJSON(w, data)
 }
 
-func (s *Server) handleHeatmap(w http.ResponseWriter, _ *http.Request) {
-	raw := s.engine.GetHeatmapData()
+func (s *Server) handleHeatmap(w http.ResponseWriter, r *http.Request) {
+	ctx, _, ok := scopedContext(r)
+	if !ok {
+		writeError(w, http.StatusUnauthorized, "unauthenticated")
+		return
+	}
+	raw, err := s.engine.GetHeatmapData(ctx)
+	if failOnScope(w, err) {
+		return
+	}
 	// Convert tui.HeatmapMinute (struct fields) to engine.HeatmapMinuteData (map)
 	data := make([]engine.HeatmapMinuteData, 0, len(raw))
 	for _, m := range raw {
@@ -107,36 +175,62 @@ func (s *Server) handleHeatmap(w http.ResponseWriter, _ *http.Request) {
 }
 
 func (s *Server) handleAnomalies(w http.ResponseWriter, r *http.Request) {
+	ctx, _, ok := scopedContext(r)
+	if !ok {
+		writeError(w, http.StatusUnauthorized, "unauthenticated")
+		return
+	}
 	filters := parseFilters(r)
-	report, err := s.engine.GetAnomalies(r.Context(), filters)
-	if err != nil {
-		writeError(w, http.StatusInternalServerError, err.Error())
+	report, err := s.engine.GetAnomalies(ctx, filters)
+	if failOnScope(w, err) {
 		return
 	}
 	writeJSON(w, map[string]string{"report": report})
 }
 
-func (s *Server) handleStreams(w http.ResponseWriter, _ *http.Request) {
-	streams := s.engine.GetStreams()
+func (s *Server) handleStreams(w http.ResponseWriter, r *http.Request) {
+	ctx, _, ok := scopedContext(r)
+	if !ok {
+		writeError(w, http.StatusUnauthorized, "unauthenticated")
+		return
+	}
+	streams, err := s.engine.GetStreams(ctx)
+	if failOnScope(w, err) {
+		return
+	}
 	writeJSON(w, streams)
 }
 
 func (s *Server) handleInsightsParams(w http.ResponseWriter, r *http.Request) {
+	ctx, _, ok := scopedContext(r)
+	if !ok {
+		writeError(w, http.StatusUnauthorized, "unauthenticated")
+		return
+	}
 	filters := parseFilters(r)
-	params, err := s.engine.QueryInsightsParams(r.Context(), filters)
-	if err != nil {
-		writeError(w, http.StatusInternalServerError, err.Error())
+	params, err := s.engine.QueryInsightsParams(ctx, filters)
+	if failOnScope(w, err) {
 		return
 	}
 	writeJSON(w, params)
 }
 
 func (s *Server) handleSeverityTimeSeries(w http.ResponseWriter, r *http.Request) {
+	ctx, _, ok := scopedContext(r)
+	if !ok {
+		writeError(w, http.StatusUnauthorized, "unauthenticated")
+		return
+	}
 	filters := parseFilters(r)
-	writeJSON(w, s.engine.QuerySeverityTimeSeries(r.Context(), filters))
+	writeJSON(w, s.engine.QuerySeverityTimeSeries(ctx, filters))
 }
 
 func (s *Server) handleTopAttributes(w http.ResponseWriter, r *http.Request) {
+	ctx, _, ok := scopedContext(r)
+	if !ok {
+		writeError(w, http.StatusUnauthorized, "unauthenticated")
+		return
+	}
 	limitStr := r.URL.Query().Get("limit")
 	limit := 20
 	if limitStr != "" {
@@ -145,8 +239,15 @@ func (s *Server) handleTopAttributes(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	attrKeyCounts := s.engine.GetLifetimeAttrKeyCounts()
-	stats := s.engine.GetStats()
+	attrKeyCounts := s.engine.GetLifetimeAttrKeyCounts(ctx)
+	if attrKeyCounts == nil {
+		writeError(w, http.StatusUnauthorized, "tenant scope required")
+		return
+	}
+	stats, err := s.engine.GetStats(ctx)
+	if failOnScope(w, err) {
+		return
+	}
 	totalLogs := int64(stats.TotalLogsEver)
 
 	// Flatten into entries and sort by count
@@ -179,10 +280,14 @@ func (s *Server) handleTopAttributes(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleSummary(w http.ResponseWriter, r *http.Request) {
+	ctx, _, ok := scopedContext(r)
+	if !ok {
+		writeError(w, http.StatusUnauthorized, "unauthenticated")
+		return
+	}
 	filters := parseFilters(r)
-	summary, err := s.engine.QuerySummary(r.Context(), filters)
-	if err != nil {
-		writeError(w, http.StatusInternalServerError, err.Error())
+	summary, err := s.engine.QuerySummary(ctx, filters)
+	if failOnScope(w, err) {
 		return
 	}
 	writeJSON(w, map[string]string{"summary": summary})
@@ -193,6 +298,9 @@ func parseFilters(r *http.Request) engine.InsightsFilters {
 	q := r.URL.Query()
 	var filters engine.InsightsFilters
 
+	// Tenant is only honored for admin scopes; resolveTenant() collapses
+	// any non-admin attempt back to the caller's own tenant.
+	filters.Tenant = q.Get("tenant")
 	if v := q.Get("start"); v != "" {
 		if ts, err := strconv.ParseInt(v, 10, 64); err == nil {
 			filters.Start = &ts
@@ -219,6 +327,45 @@ func parseFilters(r *http.Request) engine.InsightsFilters {
 	}
 
 	return filters
+}
+
+// handleTenants is an admin-only view of all active tenants.
+func (s *Server) handleTenants(w http.ResponseWriter, r *http.Request) {
+	_, id, ok := scopedContext(r)
+	if !ok {
+		writeError(w, http.StatusUnauthorized, "unauthenticated")
+		return
+	}
+	if !id.Admin {
+		writeError(w, http.StatusForbidden, "admin identity required")
+		return
+	}
+	writeJSON(w, s.engine.TenantInfos())
+}
+
+// handleRejections is an admin-only observability endpoint for the denial
+// ledger: every rejected export is visible here and in the stderr log.
+func (s *Server) handleRejections(w http.ResponseWriter, r *http.Request) {
+	_, id, ok := scopedContext(r)
+	if !ok {
+		writeError(w, http.StatusUnauthorized, "unauthenticated")
+		return
+	}
+	if !id.Admin {
+		writeError(w, http.StatusForbidden, "admin identity required")
+		return
+	}
+	if s.rejects == nil {
+		writeJSON(w, map[string]string{"error": "rejection log unavailable"})
+		return
+	}
+	limit := 200
+	if v := r.URL.Query().Get("limit"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			limit = n
+		}
+	}
+	writeJSON(w, s.rejects.Snapshot(limit))
 }
 
 func (s *Server) handleReleases(w http.ResponseWriter, _ *http.Request) {

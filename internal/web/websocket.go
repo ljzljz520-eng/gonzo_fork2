@@ -7,25 +7,28 @@ import (
 	"sync"
 	"time"
 
+	"github.com/control-theory/gonzo/internal/security"
 	"nhooyr.io/websocket"
 )
 
-// Hub manages WebSocket client connections and broadcasts messages.
+// Hub manages tenant-partitioned WebSocket client connections. A client
+// only ever receives broadcasts for the tenant its identity is scoped to.
 type Hub struct {
 	mu      sync.RWMutex
-	clients map[*Client]bool
+	clients map[string]map[*Client]bool
 }
 
-// Client represents a single WebSocket connection.
+// Client represents a single WebSocket connection bound to one tenant.
 type Client struct {
-	conn *websocket.Conn
-	send chan []byte
+	conn   *websocket.Conn
+	send   chan []byte
+	tenant string
 }
 
 // NewHub creates a new WebSocket hub.
 func NewHub() *Hub {
 	return &Hub{
-		clients: make(map[*Client]bool),
+		clients: make(map[string]map[*Client]bool),
 	}
 }
 
@@ -38,9 +41,11 @@ func (h *Hub) Run(ctx context.Context) {
 		select {
 		case <-ctx.Done():
 			h.mu.Lock()
-			for c := range h.clients {
-				close(c.send)
-				delete(h.clients, c)
+			for tenant := range h.clients {
+				for c := range h.clients[tenant] {
+					close(c.send)
+					delete(h.clients[tenant], c)
+				}
 			}
 			h.mu.Unlock()
 			return
@@ -50,29 +55,37 @@ func (h *Hub) Run(ctx context.Context) {
 	}
 }
 
-// Register adds a client to the hub.
+// Register adds a tenant-bound client to the hub.
 func (h *Hub) Register(c *Client) {
 	h.mu.Lock()
-	h.clients[c] = true
+	if h.clients[c.tenant] == nil {
+		h.clients[c.tenant] = make(map[*Client]bool)
+	}
+	h.clients[c.tenant][c] = true
 	h.mu.Unlock()
 }
 
 // Unregister removes a client from the hub.
 func (h *Hub) Unregister(c *Client) {
 	h.mu.Lock()
-	if _, ok := h.clients[c]; ok {
-		close(c.send)
-		delete(h.clients, c)
+	if set := h.clients[c.tenant]; set != nil {
+		if _, ok := set[c]; ok {
+			close(c.send)
+			delete(set, c)
+		}
+		if len(set) == 0 {
+			delete(h.clients, c.tenant)
+		}
 	}
 	h.mu.Unlock()
 }
 
-// Broadcast sends a message to all connected clients.
-func (h *Hub) Broadcast(msg []byte) {
+// Broadcast sends a message only to clients subscribed to tenant.
+func (h *Hub) Broadcast(tenant string, msg []byte) {
 	h.mu.RLock()
 	defer h.mu.RUnlock()
 
-	for c := range h.clients {
+	for c := range h.clients[tenant] {
 		select {
 		case c.send <- msg:
 		default:
@@ -81,10 +94,24 @@ func (h *Hub) Broadcast(msg []byte) {
 	}
 }
 
-// handleWebSocket handles WebSocket upgrade and manages the connection.
+// handleWebSocket handles WebSocket upgrade and manages the connection. The
+// guard has already authenticated the request; the identity pins the
+// connection to a tenant for its entire lifetime.
 func (s *Server) handleWebSocket(w http.ResponseWriter, r *http.Request) {
+	id, ok := security.IdentityFromContext(r.Context())
+	if !ok || id == nil {
+		http.Error(w, `{"error":"unauthenticated"}`, http.StatusUnauthorized)
+		return
+	}
+
+	tenant := id.Tenant
+	// Admins may subscribe to a specific tenant; non-admins are pinned.
+	if requested := r.URL.Query().Get("tenant"); requested != "" && id.Admin {
+		tenant = requested
+	}
+
 	conn, err := websocket.Accept(w, r, &websocket.AcceptOptions{
-		InsecureSkipVerify: true, // Allow any origin (localhost only)
+		InsecureSkipVerify: true, // Loopback-only surface; auth handled by guard
 	})
 	if err != nil {
 		log.Printf("WebSocket accept error: %v", err)
@@ -92,8 +119,9 @@ func (s *Server) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 	}
 
 	client := &Client{
-		conn: conn,
-		send: make(chan []byte, 64),
+		conn:   conn,
+		send:   make(chan []byte, 64),
+		tenant: tenant,
 	}
 	s.hub.Register(client)
 
